@@ -19,6 +19,4 @@ base64 -i "IMAGE NAME HERE.jpg" -o test_base64.txt
 
 Then run the curl command:
 
-curl -X POST "http://localhost:8000/v1/completions" \\
--H "Content-Type: application/json" \\
--d '{ "messages": [ { "role": "user", "content": [ { "type": "image", "image": "'$(cat test_base64.txt)'" }, { "type": "text", "text": "Output the handwritten text from the image." } ] } ], "max_tokens": 50 }'
+curl -X POST "http://localhost:8000/v1/completions" -H "Content-Type: application/json" -d '{ "messages": [ { "role": "user", "content": [ { "type": "image", "image": "'$(cat test_base64.txt)'" }, { "type": "text", "text": "Output the handwritten text from the image." } ] } ], "max_tokens": 50 }'
