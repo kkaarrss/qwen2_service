@@ -1,254 +1,274 @@
-import tempfile, os
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer, AutoProcessor
-from qwen_vl_utils import process_vision_info
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import List, Union, Optional
-from pydantic import HttpUrl
-from PIL import Image, UnidentifiedImageError, ExifTags
-import base64, io, torch
-import cv2
-import numpy as np
-import time
-from doctr.io import DocumentFile
-from doctr.utils.geometry import rotate_image
-from doctr.models import ocr_predictor
+# Qwen-VL OpenAI-Compatible API Server (qwen2_service)
 
-doctr_model = ocr_predictor(
-    det_arch="db_resnet50",
-    reco_arch="parseq",
-    pretrained=True,
-    det_bs=8,
-    reco_bs=1024,
-    assume_straight_pages=False,
-    straighten_pages=True,
-    detect_orientation=True,
-).cuda().half()
+This project provides an OpenAI-compatible API endpoint for interacting with a Quantized Qwen2.5-VL model (specifically `unsloth/Qwen2.5-VL-7B-Instruct-unsloth-bnb-4bit` by default), served via FastAPI. It allows you to send text and image inputs and receive text-based responses, mimicking the OpenAI Chat Completions API structure.
 
-# .5 Orientation Correction
-def correct_orientation(image):
-    doc = DocumentFile.from_images(image)
-    result = doctr_model(doc)
-    json_res = result.export()
-    print("Orientation: ", json_res['pages'][0]['orientation']['value'])
+**Repository:** [https://github.com/kkaarrss/qwen2_service](https://github.com/kkaarrss/qwen2_service)
 
-    return rotate_image(cv2.imread(image), json_res['pages'][0]['orientation']['value'], expand=True)
+## Features
 
-# 1. Normalization
-def normalize_image(image):
-    norm_img = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
-    return cv2.normalize(image, norm_img, 0, 255, cv2.NORM_MINMAX)
+-   **OpenAI Compatibility:** Exposes `/v1/chat/completions` and `/v1/models` endpoints.
+-   **Vision-Language Model:** Powered by Qwen2.5-VL.
+-   **4-bit Quantization:** Uses `BitsAndBytesConfig` for efficient model loading.
+-   **Streaming Support:** Provides real token-by-token streaming for responses.
+-   **Image Handling:** Accepts images as URLs or base64 strings.
+-   **Simplified Image Preprocessing:** Relies on PIL for basic validation and the Hugging Face `AutoProcessor` for model-specific image transformations.
+-   **Dockerized:** Includes a Dockerfile and a pre-built image on Docker Hub (`pluskars/qwen-vl`).
 
-# 4. Noise Removal
-def remove_noise(image):
-    return cv2.fastNlMeansDenoisingColored(image, None, 10, 10, 7, 15)
+## Prerequisites
 
-def increase_contrast_color(image):
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
+### Common for All Methods:
 
-    # Apply CLAHE to the L channel
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    cl = clahe.apply(l)
+-   **NVIDIA GPU & Drivers:** Required for running the model efficiently. Ensure you have compatible NVIDIA drivers installed.
+-   **CUDA Toolkit:** The version should be compatible with the PyTorch version used (e.g., CUDA 11.8 or 12.x). The Docker image `pluskars/qwen-vl` is built with a CUDA 12.8.1 base.
+-   **Python (for local setup):** Python 3.10 or newer is recommended.
 
-    # Merge channels and convert back to BGR
-    lab = cv2.merge((cl, a, b))
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+### For Running Without Docker (Local Setup from Source):
 
-def preprocess_image_for_ocr(image_data):
-    image = correct_orientation(image_data)
+-   **Virtual Environment (Recommended):**
+    ```bash
+    python3 -m venv venv
+    source venv/bin/activate
+    ```
+-   **Python Dependencies:** Install using the `requirements.txt` file.
 
-    if image is None:
-        raise ValueError(f"Failed to load the image. Check the file path or format: {image_data}")
+### For Running With Docker:
 
-    cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+-   **Docker:** Install Docker Engine.
+-   **NVIDIA Container Toolkit:** Essential for GPU access within Docker containers. Follow the installation guide for your OS: [NVIDIA Container Toolkit Installation Guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 
-    # Convert image data to numpy array (if needed)
-    # image = cv2.imdecode(np.frombuffer(image, np.uint8), cv2.IMREAD_UNCHANGED)
+## Setup & Running
 
-    # Resize to fit within a 2000x2000 box while maintaining aspect ratio
-    height, width = image.shape[:2]
-    scaling_factor = min(3072 / width, 3072 / height)
-    if scaling_factor < 1:  # Only resize if the image is larger than 2000x2000
-        new_size = (int(width * scaling_factor), int(height * scaling_factor))
-        image = cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
+The main application script is `text_unsloth_2_5.py`.
 
-    # Normalize the image
-    image = normalize_image(image)
+### Option 1: Running with Docker (Recommended - Easiest)
 
-    # Noise removal
-    image = remove_noise(image)
+This uses the pre-built image from Docker Hub.
 
-    # Increase contrast
-    image = increase_contrast_color(image)
+1.  **Pull the Docker image:**
+    ```bash
+    docker pull pluskars/qwen-vl:latest
+    ```
 
-    cv2.imwrite('processed_image.png', image)
-    return 'processed_image.png'
+2.  **Run the Docker container:**
+    This command runs the container in detached mode (`-d`), maps port `31000` from the container to the host (the application inside listens on port `31000`), enables GPU access, and mounts your local Hugging Face cache to speed up model downloads on subsequent runs if models weren't baked into the image or if you switch models.
 
-# default: Load the model on the available device(s)
-model, processor = FastVisionModel.from_pretrained(
-    "unsloth/Qwen2-VL-7B-Instruct",
-    load_in_4bit = True, # Use 4bit to reduce memory use. False for 16bit LoRA.
-    use_gradient_checkpointing = "unsloth", # True or "unsloth" for long context
-)
+    ```bash
+    # Ensure NVIDIA Container Toolkit is installed and Docker daemon is restarted if needed.
+    # Create the cache directory on your host if it doesn't exist:
+    mkdir -p ~/.cache/huggingface
 
-# The default range for the number of visual tokens per image in the model is 4-16384. You can set min_pixels and max_pixels according to your needs, such as a token count range of 256-1280, to balance speed and memory usage.
-min_pixels = 256*28*28
-max_pixels = 1280*28*28
-processor = AutoProcessor.from_pretrained("/models/Qwen2.5-VL-7B-Instruct", min_pixels=min_pixels, max_pixels=max_pixels)
+    docker run -d \
+        --gpus all \
+        -p 31000:31000 \
+        -v ~/.cache/huggingface:/root/.cache/huggingface \
+        pluskars/qwen-vl:latest
+    ```
 
-messages = [
+3.  **Check container logs (optional):**
+    Find the container ID using `docker ps`.
+    ```bash
+    docker logs <container_id_or_name> -f
+    ```
+    The server will be available at `http://localhost:31000`.
+
+### Option 2: Running Locally from Source (Without Docker)
+
+1.  **Clone the repository:**
+    ```bash
+    git clone https://github.com/kkaarrss/qwen2_service.git
+    cd qwen2_service
+    ```
+
+2.  **Create and activate a Python virtual environment (recommended):**
+    ```bash
+    python3 -m venv venv
+    source venv/bin/activate  # On Linux/macOS
+    # venv\Scripts\activate   # On Windows
+    ```
+
+3.  **Install dependencies:**
+    (Ensure you have a `requirements.txt` file as specified below)
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+4.  **Run the FastAPI application using Uvicorn:**
+    The script `text_unsloth_2_5.py` contains the Uvicorn runner in its `if __name__ == "__main__":` block.
+    ```bash
+    python text_unsloth_2_5.py
+    ```
+    The server will start on `http://0.0.0.0:31000` (or the port configured in `text_unsloth_2_5.py`).
+
+### `requirements.txt` Content
+
+If setting up locally, create a `requirements.txt` file with:
+```txt
+# Core ML/DL Libraries
+torch
+torchvision
+torchaudio
+transformers
+accelerate
+bitsandbytes
+
+# Web Framework & Server
+fastapi
+pydantic
+uvicorn[standard]
+
+# Image Handling
+Pillow
+
+# Utilities
+requests
+qwen-vl-utils
+```
+
+## API Endpoints
+
+The server exposes the following OpenAI-compatible endpoints:
+
+### 1. List Models
+
+-   **Endpoint:** `GET /v1/models`
+-   **Description:** Returns a list of available models.
+-   **Example Response:**
+    ```json
     {
-        "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
-            },
-            {"type": "text", "text": "Describe this image."},
-        ],
+      "object": "list",
+      "data": [
+        {
+          "id": "unsloth/Qwen2.5-VL-7B-Instruct-unsloth-bnb-4bit",
+          "object": "model",
+          "created": 1677610600,
+          "owned_by": "custom"
+        }
+      ]
     }
-]
+    ```
 
+### 2. Chat Completions
 
-app = FastAPI()
+-   **Endpoint:** `POST /v1/chat/completions`
+-   **Description:** Generates a model response. Supports text and image inputs, and streaming.
+-   **Request Body (Example with Image):**
+    ```json
+    {
+      "model": "unsloth/Qwen2.5-VL-7B-Instruct-unsloth-bnb-4bit",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "What is in this image?"
+            },
+            {
+              "type": "image_url",
+              "image_url": {
+                "url": "data:image/jpeg;base64,/9j/4AAQSk...==" // Or an https:// URL
+              }
+            }
+          ]
+        }
+      ],
+      "max_tokens": 150,
+      "stream": false, // Set to true for streaming
+      "temperature": 0.7
+    }
+    ```
+-   **Non-Streaming Response & Streaming Response:** (Examples as in the previous README version)
 
-class ImageContent(BaseModel):
-    type: str = "image"
-    image: str
+*(Keep the Non-Streaming and Streaming Response examples from the previous README here)*
 
-class TextContent(BaseModel):
-    type: str = "text"
-    text: str
+## Example `curl` Requests
 
-class Message(BaseModel):
-    role: str
-    content: List[Union[ImageContent, TextContent]]
+*(Keep the curl examples from the previous README here, ensuring the port is 31000)*
 
-class RequestBody(BaseModel):
-    messages: List[Message]
-    max_tokens: Optional[int] = 5000
-    temperature: Optional[float] = 0.3
-    repetition_penalty: Optional[float] = 1.2
+**List Models:**
+```bash
+curl http://localhost:31000/v1/models
+```
 
-@app.post("/v1/completions")
-async def create_completion(request: RequestBody):
+**Chat Completion (Non-Streaming, Text-Only):**
+```bash
+curl -X POST http://localhost:31000/v1/chat/completions \
+-H "Content-Type: application/json" \
+-d '{
+  "messages": [{"role": "user", "content": "Hello, how are you?"}],
+  "max_tokens": 50
+}'
+```
 
-    messages = request.messages
-    max_tokens = request.max_tokens
-    temperature = request.temperature
-    repetition_penalty = request.repetition_penalty
+**Chat Completion (Non-Streaming, with Image URL):**
+```bash
+curl -X POST http://localhost:31000/v1/chat/completions \
+-H "Content-Type: application/json" \
+-d '{
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Describe this image:"},
+        {"type": "image_url", "image_url": {"url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"}}
+      ]
+    }
+  ],
+  "max_tokens": 100
+}'
+```
 
-    # Temporarily save byte[] data to disk as a file and use its path
-    temp_files = []
-    try:
-        messages_dict = []
-        for message in messages:
-            content_dict = []
-            for content in message.content:
-                if isinstance(content, ImageContent):
-                    try:
-                        # Decode the base64 image data
-                        image_data = base64.b64decode(content.image)
+**Chat Completion (Streaming, with Base64 Image):**
+```bash
+# Replace YOUR_BASE64_IMAGE_STRING with actual base64 data
+BASE64_IMAGE="YOUR_BASE64_IMAGE_STRING"
 
-                        # Open the image directly from bytes to check validity
-                        print("Opening image...", flush=True)
-                        Image.MAX_IMAGE_PIXELS = None   # disables the warning
-                        image = Image.open(io.BytesIO(image_data))
-                        print("Image opened", flush=True)
-                        image.verify()  # This will raise an exception if the image is not valid
-                        print("Image verified", flush=True)
+curl -N -X POST http://localhost:31000/v1/chat/completions \
+-H "Content-Type: application/json" \
+-H "Accept: text/event-stream" \
+-d @- <<EOF
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "What's in this picture?"},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,${BASE64_IMAGE}"}}
+      ]
+    }
+  ],
+  "stream": true,
+  "max_tokens": 100
+}
+EOF
+```
+*Note: Added `-N` (no-buffering) to the streaming `curl` example for better SSE display.*
 
-                        # Reopen the image (since verify() can leave it in an unusable state)
-                        image = Image.open(io.BytesIO(image_data))
-                        # Determine the correct file extension based on image format
-                        image_format = image.format.lower()
-                        if image_format == "mpo":
-                            image_format = "jpeg"
+## Troubleshooting
 
-                        try:
-                            for orientation in ExifTags.TAGS.keys():
-                                if ExifTags.TAGS[orientation] == 'Orientation':
-                                    break
-                            exif = image._getexif()
-                            if exif is not None and orientation in exif:
-                                print(f"Orientation: {exif[orientation]}", flush=True)
-                                if exif[orientation] == 3:
-                                    image = image.rotate(180, expand=True)
-                                elif exif[orientation] == 6:
-                                    image = image.rotate(270, expand=True)
-                                elif exif[orientation] == 8:
-                                    image = image.rotate(90, expand=True)
-                        except (AttributeError, KeyError, IndexError):
-                            # Image has no EXIF orientation data
-                            pass
+-   **GPU Not Detected in Docker:** Ensure NVIDIA Container Toolkit is correctly installed and your Docker daemon is configured/restarted. Test with `docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu24.04 nvidia-smi`.
+-   **Model Download Issues:** Ensure network connectivity. If using Docker, mounting `~/.cache/huggingface` can help persist downloads if the model isn't fully baked into the `pluskars/qwen-vl` image or for future model updates.
+-   **Port Conflicts:** If port `31000` is already in use, the Docker command will fail to map it. Ensure the port is free or change the mapping (e.g., `-p 31001:31000`).
+-   **`qwen-vl-utils` Version:** Ensure the pip-installed version is compatible with your `transformers` library version.
 
+## Building the Docker Image (Optional - if modifying the source)
 
-                        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f".{image_format}")
-                        print(temp_file.name, flush=True)
+If you clone the repository and make changes to `text_unsloth_2_5.py` or `Dockerfile`, you can build your own image:
+```bash
+# In the root of the cloned repository (qwen2_service)
+docker build -t my-qwen-vl-api:latest .
+```
+Then run your custom image instead of `pluskars/qwen-vl:latest`.
+Make sure your `Dockerfile` copies `text_unsloth_2_5.py` and installs `qwen-vl-utils` from `requirements.txt`.
+```
 
-                        # Save the image to a temporary file
-                        image.save(temp_file, format=image_format.upper())
-                        temp_file.flush()
-                        temp_files.append(temp_file.name)
+**Key Updates to this README:**
 
-                        processed_file_name = preprocess_image_for_ocr(temp_file.name)
-
-                        # Update the image field with the file path
-                        content_dict.append({
-                            "type": "image",
-                            "image": f"file://{processed_file_name}"
-                        })
-                        print(content_dict, flush=True)
-                    except UnidentifiedImageError as e:
-                        return {"error": "Invalid image data: could not identify image."}
-                    except Exception as e:
-                        return {"error": str(e)}
-
-
-                else:
-                    # For TextContent, just append as is
-                    content_dict.append(content.dict())
-
-            # Add to the messages dictionary
-            messages_dict.append({
-                "role": message.role,
-                "content": content_dict
-            })
-
-        print(messages_dict, flush=True)
-        # Preparation for inference
-        text = processor.apply_chat_template(
-            messages_dict, tokenize=False, add_generation_prompt=True
-        )
-        print(f"text: {text}", flush=True)
-        image_inputs, video_inputs = process_vision_info(messages_dict)
-        inputs = processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
-        inputs = inputs.to("cuda")
-
-        # Inference: Generation of the output
-        generated_ids = model.generate(**inputs, max_new_tokens=max_tokens, temperature=temperature, repetition_penalty=repetition_penalty)
-        generated_ids_trimmed = [
-            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-        ]
-        output_text = processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )
-        print(output_text[0], flush=True)
-
-        return output_text[0]
-
-    finally:
-        # Clean up the temporary files
-        for temp_file in temp_files:
-            os.remove(temp_file)
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+*   **Repository Link:** Added your GitHub repo link.
+*   **Docker Hub Image:** Prioritized running from `pluskars/qwen-vl:latest`.
+*   **Local Setup:** Clarified that it's for running from the source code.
+*   **`requirements.txt`:** Updated to include `qwen-vl-utils`.
+*   **Filenames:** Consistently used `text_unsloth_2_5.py`.
+*   **Ports:** Standardized on port `31000` for examples, assuming this is what `text_unsloth_2_5.py` and your Docker image's `CMD`/`EXPOSE` are configured for.
+*   **Streaming Curl:** Added `-N` to the streaming curl example.
+*   **Building Docker Image Section:** Added an optional section for users who want to build the image from source after modifications.
