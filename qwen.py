@@ -1,254 +1,382 @@
-import tempfile, os
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer, AutoProcessor
-from qwen_vl_utils import process_vision_info
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import List, Union, Optional
-from pydantic import HttpUrl
-from PIL import Image, UnidentifiedImageError, ExifTags
-import base64, io, torch
-import cv2
-import numpy as np
+import tempfile
+import os
+import base64
+import io
+import torch
+# import cv2 # Not currently used
+# import numpy as np # Not currently used
 import time
-from doctr.io import DocumentFile
-from doctr.utils.geometry import rotate_image
-from doctr.models import ocr_predictor
+import uuid
+import requests # For downloading images from URLs
+import asyncio # For streaming
+import json # For streaming JSON objects
 
-doctr_model = ocr_predictor(
-    det_arch="db_resnet50",
-    reco_arch="parseq",
-    pretrained=True,
-    det_bs=8,
-    reco_bs=1024,
-    assume_straight_pages=False,
-    straighten_pages=True,
-    detect_orientation=True,
-).cuda().half()
+from PIL import Image, UnidentifiedImageError
 
-# .5 Orientation Correction
-def correct_orientation(image):
-    doc = DocumentFile.from_images(image)
-    result = doctr_model(doc)
-    json_res = result.export()
-    print("Orientation: ", json_res['pages'][0]['orientation']['value'])
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
+from transformers.generation.streamers import TextIteratorStreamer
+from threading import Thread
 
-    return rotate_image(cv2.imread(image), json_res['pages'][0]['orientation']['value'], expand=True)
+from qwen_vl_utils import process_vision_info # Ensure this is the official version
 
-# 1. Normalization
-def normalize_image(image):
-    norm_img = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
-    return cv2.normalize(image, norm_img, 0, 255, cv2.NORM_MINMAX)
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field, HttpUrl
+from typing import List, Union, Optional, Dict, Literal, AsyncGenerator
 
-# 4. Noise Removal
-def remove_noise(image):
-    return cv2.fastNlMeansDenoisingColored(image, None, 10, 10, 7, 15)
+# --- Global Variables for Model and Processor ---
+model = None
+processor = None
 
-def increase_contrast_color(image):
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
+# --- Configuration ---
+MODEL_NAME = "unsloth/Qwen2.5-VL-7B-Instruct-unsloth-bnb-4bit"
+MIN_PIXELS = 256*28*28
+MAX_PIXELS = 1280*28*28
 
-    # Apply CLAHE to the L channel
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    cl = clahe.apply(l)
+# --- FastAPI App ---
+app = FastAPI(title="Qwen VL OpenAI-Compatible API (Cleaned)")
 
-    # Merge channels and convert back to BGR
-    lab = cv2.merge((cl, a, b))
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+@app.on_event("startup")
+async def startup_event():
+    global model, processor
 
-def preprocess_image_for_ocr(image_data):
-    image = correct_orientation(image_data)
+    print(f"INFO: Loading Qwen VL model ({MODEL_NAME}) on startup...")
+    try:
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
+        )
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            MODEL_NAME,
+            quantization_config=quantization_config,
+            device_map="auto",
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        )
+        processor = AutoProcessor.from_pretrained(
+            MODEL_NAME,
+            min_pixels=MIN_PIXELS,
+            max_pixels=MAX_PIXELS,
+            trust_remote_code=True
+        )
+        print("INFO: Qwen VL model and processor loaded successfully.")
+    except Exception as e:
+        print(f"CRITICAL ERROR: Failed to load Qwen VL model or processor during startup: {e}")
+        import traceback
+        traceback.print_exc()
+        # Consider exiting if model loading fails
 
-    if image is None:
-        raise ValueError(f"Failed to load the image. Check the file path or format: {image_data}")
+# --- Simplified Image Handling ---
+def save_image_to_temp_file(image_bytes: bytes, image_format: str, output_dir: str) -> str:
+    """Saves image bytes to a temporary file and returns its path."""
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as pil_image:
+            pil_image.verify()
 
-    cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        safe_suffix = f".{image_format.lower().split('/')[-1]}"
+        if safe_suffix == ".jpg": safe_suffix = ".jpeg"
 
-    # Convert image data to numpy array (if needed)
-    # image = cv2.imdecode(np.frombuffer(image, np.uint8), cv2.IMREAD_UNCHANGED)
+        fd, temp_image_path = tempfile.mkstemp(suffix=safe_suffix, dir=output_dir)
+        with os.fdopen(fd, "wb") as tmp_file:
+            tmp_file.write(image_bytes)
+        # print(f"DEBUG: Saved raw image for Qwen to temporary file: {temp_image_path}") # Optional debug
+        return temp_image_path
+    except Exception as e:
+        print(f"ERROR: Failed to save image to temp file: {e}")
+        raise
 
-    # Resize to fit within a 2000x2000 box while maintaining aspect ratio
-    height, width = image.shape[:2]
-    scaling_factor = min(3072 / width, 3072 / height)
-    if scaling_factor < 1:  # Only resize if the image is larger than 2000x2000
-        new_size = (int(width * scaling_factor), int(height * scaling_factor))
-        image = cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
+# --- Pydantic Models ---
+class ModelCard(BaseModel):
+    id: str
+    object: str = "model"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    owned_by: str = "custom"
 
-    # Normalize the image
-    image = normalize_image(image)
+class ModelList(BaseModel):
+    object: str = "list"
+    data: List[ModelCard]
 
-    # Noise removal
-    image = remove_noise(image)
+class OpenAIImageURL(BaseModel):
+    url: Union[HttpUrl, str]
+    detail: Optional[str] = "auto"
 
-    # Increase contrast
-    image = increase_contrast_color(image)
-
-    cv2.imwrite('processed_image.png', image)
-    return 'processed_image.png'
-
-# default: Load the model on the available device(s)
-model, processor = FastVisionModel.from_pretrained(
-    "unsloth/Qwen2-VL-7B-Instruct",
-    load_in_4bit = True, # Use 4bit to reduce memory use. False for 16bit LoRA.
-    use_gradient_checkpointing = "unsloth", # True or "unsloth" for long context
-)
-
-# The default range for the number of visual tokens per image in the model is 4-16384. You can set min_pixels and max_pixels according to your needs, such as a token count range of 256-1280, to balance speed and memory usage.
-min_pixels = 256*28*28
-max_pixels = 1280*28*28
-processor = AutoProcessor.from_pretrained("/models/Qwen2.5-VL-7B-Instruct", min_pixels=min_pixels, max_pixels=max_pixels)
-
-messages = [
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
-            },
-            {"type": "text", "text": "Describe this image."},
-        ],
-    }
-]
-
-
-app = FastAPI()
-
-class ImageContent(BaseModel):
-    type: str = "image"
-    image: str
-
-class TextContent(BaseModel):
-    type: str = "text"
+class OpenAIContentPartText(BaseModel):
+    type: Literal["text"]
     text: str
 
-class Message(BaseModel):
-    role: str
-    content: List[Union[ImageContent, TextContent]]
+class OpenAIContentPartImage(BaseModel):
+    type: Literal["image_url"]
+    image_url: OpenAIImageURL
 
-class RequestBody(BaseModel):
-    messages: List[Message]
-    max_tokens: Optional[int] = 5000
-    temperature: Optional[float] = 0.3
-    repetition_penalty: Optional[float] = 1.2
+OpenAIContentPart = Union[OpenAIContentPartText, OpenAIContentPartImage]
 
-@app.post("/v1/completions")
-async def create_completion(request: RequestBody):
+class OpenAIMessage(BaseModel):
+    role: Literal["user", "assistant", "system"]
+    content: Union[str, List[OpenAIContentPart]]
+    name: Optional[str] = None
 
-    messages = request.messages
-    max_tokens = request.max_tokens
-    temperature = request.temperature
-    repetition_penalty = request.repetition_penalty
+class OpenAIChatCompletionRequest(BaseModel):
+    model: Optional[str] = MODEL_NAME
+    messages: List[OpenAIMessage]
+    max_tokens: Optional[int] = 1536
+    temperature: Optional[float] = 0.7
+    top_p: Optional[float] = 1.0
+    n: Optional[int] = 1
+    stream: Optional[bool] = False
+    stop: Optional[Union[str, List[str]]] = None
+    presence_penalty: Optional[float] = 0.0
+    frequency_penalty: Optional[float] = 0.0
+    logit_bias: Optional[Dict[str, float]] = None
+    user: Optional[str] = None
+    repetition_penalty: Optional[float] = 1.1
 
-    # Temporarily save byte[] data to disk as a file and use its path
-    temp_files = []
+class StreamChoiceDelta(BaseModel):
+    content: Optional[str] = None
+    role: Optional[Literal["assistant"]] = None
+
+class StreamChoice(BaseModel):
+    index: int
+    delta: StreamChoiceDelta
+    finish_reason: Optional[Literal["stop", "length"]] = None
+
+class OpenAIChatCompletionStreamResponse(BaseModel):
+    id: str
+    object: str = "chat.completion.chunk"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: List[StreamChoice]
+
+class ResponseMessage(BaseModel):
+    role: Literal["assistant"]
+    content: str
+
+class ChatCompletionChoice(BaseModel):
+    index: int
+    message: ResponseMessage
+    finish_reason: Optional[Literal["stop", "length"]] = "stop"
+
+class UsageInfo(BaseModel):
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+class OpenAIChatCompletionResponse(BaseModel):
+    id: str
+    object: str = "chat.completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: List[ChatCompletionChoice]
+    usage: Optional[UsageInfo] = Field(default_factory=UsageInfo)
+
+
+# --- API Endpoints ---
+@app.get("/v1/models", response_model=ModelList)
+async def list_models_endpoint():
+    global MODEL_NAME
+    model_card = ModelCard(id=MODEL_NAME)
+    return ModelList(data=[model_card])
+
+async def true_generate_response_stream(
+    inputs_on_device: Dict,
+    gen_kwargs: Dict,
+    request_id: str,
+    model_name_str: str,
+    hf_processor # Passed from global processor
+) -> AsyncGenerator[str, None]:
+    streamer = TextIteratorStreamer(hf_processor, skip_prompt=True, skip_special_tokens=True)
+    generation_thread_kwargs = {**inputs_on_device, **gen_kwargs, "streamer": streamer}
+    thread = Thread(target=model.generate, kwargs=generation_thread_kwargs)
+    thread.start()
+    assistant_role_sent = False
+    for new_text in streamer:
+        if new_text:
+            delta_content_dict = {}
+            if not assistant_role_sent:
+                delta_content_dict['role'] = "assistant"
+                assistant_role_sent = True
+            delta_content_dict['content'] = new_text
+
+            delta = StreamChoiceDelta(**delta_content_dict)
+            stream_response = OpenAIChatCompletionStreamResponse(
+                id=request_id, model=model_name_str, choices=[StreamChoice(index=0, delta=delta)]
+            )
+            yield f"data: {stream_response.model_dump_json()}\n\n"
+            await asyncio.sleep(0.001) # Minimal sleep to allow I/O
+
+    thread.join()
+    final_delta = StreamChoiceDelta()
+    final_choice = StreamChoice(index=0, delta=final_delta, finish_reason="stop")
+    final_stream_response = OpenAIChatCompletionStreamResponse(
+        id=request_id, model=model_name_str, choices=[final_choice]
+    )
+    yield f"data: {final_stream_response.model_dump_json()}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+@app.post("/v1/chat/completions")
+async def create_chat_completion(request: OpenAIChatCompletionRequest, raw_http_request: Request):
+    global model, processor, MODEL_NAME
+
+    if model is None or processor is None:
+        print("ERROR: Model or processor not loaded during request. Check startup logs.")
+        raise HTTPException(status_code=503, detail="Model is not available. Please try again later.")
+
+    # Optional: Log basic request info, less verbose than full body
+    print(f"INFO: Received request for model '{request.model}', stream: {request.stream}, messages: {len(request.messages)}")
+
+    if request.n is not None and request.n > 1:
+        raise HTTPException(status_code=400, detail="Generating multiple choices (n > 1) is not supported.")
+
+    temp_files_to_clean = []
+    temp_dir_prefix = "qwen_vl_api_tmp_"
+    temp_dir = tempfile.mkdtemp(prefix=temp_dir_prefix)
+    request_id = f"chatcmpl-{uuid.uuid4().hex}"
+
     try:
-        messages_dict = []
-        for message in messages:
-            content_dict = []
-            for content in message.content:
-                if isinstance(content, ImageContent):
-                    try:
-                        # Decode the base64 image data
-                        image_data = base64.b64decode(content.image)
+        qwen_messages_dict = []
 
-                        # Open the image directly from bytes to check validity
-                        print("Opening image...", flush=True)
-                        Image.MAX_IMAGE_PIXELS = None   # disables the warning
-                        image = Image.open(io.BytesIO(image_data))
-                        print("Image opened", flush=True)
-                        image.verify()  # This will raise an exception if the image is not valid
-                        print("Image verified", flush=True)
+        for oai_message in request.messages:
+            qwen_content_parts = []
+            if isinstance(oai_message.content, str):
+                qwen_content_parts.append({"type": "text", "text": oai_message.content})
+            elif isinstance(oai_message.content, list):
+                for part in oai_message.content:
+                    if part.type == "text":
+                        qwen_content_parts.append({"type": "text", "text": part.text})
+                    elif part.type == "image_url":
+                        image_url_data = str(part.image_url.url)
+                        image_bytes, image_format = None, "png"
+                        if image_url_data.startswith("http"):
+                            try:
+                                img_response = requests.get(image_url_data, timeout=20)
+                                img_response.raise_for_status()
+                                image_bytes = img_response.content
+                                content_type = img_response.headers.get("Content-Type", "").lower()
+                                if "jpeg" in content_type or "jpg" in content_type: image_format = "jpeg"
+                                elif "png" in content_type: image_format = "png"
+                                elif "webp" in content_type: image_format = "webp"
+                            except requests.RequestException as e:
+                                print(f"ERROR: Failed to download image from URL {image_url_data}: {e}")
+                                raise HTTPException(status_code=400, detail=f"Failed to download image: {e}")
+                        elif image_url_data.startswith("data:image"):
+                            try:
+                                header, encoded = image_url_data.split(",", 1)
+                                image_format = header.split("/")[1].split(";")[0].lower()
+                                if image_format not in ["jpeg", "jpg", "png", "webp", "gif", "bmp"]:
+                                    raise ValueError(f"Unsupported image format in data URI: {image_format}")
+                                image_bytes = base64.b64decode(encoded)
+                            except Exception as e:
+                                print(f"ERROR: Invalid base64 image data: {e}")
+                                raise HTTPException(status_code=400, detail=f"Invalid base64 image data: {e}")
+                        else:
+                            print(f"ERROR: Unsupported image URL format: {image_url_data}")
+                            raise HTTPException(status_code=400, detail="Unsupported image URL format.")
 
-                        # Reopen the image (since verify() can leave it in an unusable state)
-                        image = Image.open(io.BytesIO(image_data))
-                        # Determine the correct file extension based on image format
-                        image_format = image.format.lower()
-                        if image_format == "mpo":
-                            image_format = "jpeg"
+                        if image_bytes:
+                            try:
+                                # Save to temp file for process_vision_info
+                                temp_image_path = save_image_to_temp_file(image_bytes, image_format, temp_dir)
+                                temp_files_to_clean.append(temp_image_path)
+                                qwen_content_parts.append({"type": "image", "image": f"file://{temp_image_path}"})
+                            except UnidentifiedImageError as e_unid:
+                                print(f"ERROR: Invalid or unidentified image: {e_unid}")
+                                raise HTTPException(status_code=400, detail=f"Invalid or unidentified image: {e_unid}")
+                            except Exception as e_pil:
+                                print(f"ERROR: Error processing image with PIL/saving: {e_pil}")
+                                raise HTTPException(status_code=500, detail=f"Error processing image: {e_pil}")
+            qwen_messages_dict.append({"role": oai_message.role, "content": qwen_content_parts})
 
-                        try:
-                            for orientation in ExifTags.TAGS.keys():
-                                if ExifTags.TAGS[orientation] == 'Orientation':
-                                    break
-                            exif = image._getexif()
-                            if exif is not None and orientation in exif:
-                                print(f"Orientation: {exif[orientation]}", flush=True)
-                                if exif[orientation] == 3:
-                                    image = image.rotate(180, expand=True)
-                                elif exif[orientation] == 6:
-                                    image = image.rotate(270, expand=True)
-                                elif exif[orientation] == 8:
-                                    image = image.rotate(90, expand=True)
-                        except (AttributeError, KeyError, IndexError):
-                            # Image has no EXIF orientation data
-                            pass
+        text_prompt = processor.apply_chat_template(qwen_messages_dict, tokenize=False, add_generation_prompt=True)
 
+        final_image_inputs_for_processor, final_video_inputs_for_processor = [], []
+        contains_qwen_image_parts = any("image" == part.get("type") for m in qwen_messages_dict for part in m.get("content", []) if isinstance(m.get("content"), list))
 
-                        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f".{image_format}")
-                        print(temp_file.name, flush=True)
+        if contains_qwen_image_parts:
+            try:
+                img_proc_arg = processor.image_processor if hasattr(processor, 'image_processor') else None
+                pvi_pil_images, pvi_video_paths, _pvi_video_info = process_vision_info(qwen_messages_dict, img_proc_arg)
+                final_image_inputs_for_processor = pvi_pil_images
+                final_video_inputs_for_processor = pvi_video_paths
+                if final_image_inputs_for_processor:
+                    print(f"INFO: process_vision_info returned {len(final_image_inputs_for_processor)} PIL image(s).")
+            except Exception as e_pvi:
+                print(f"ERROR: During process_vision_info: {type(e_pvi).__name__} - {e_pvi}. Vision inputs will be empty.")
+                # Fallback handled by final_image_inputs_for_processor remaining empty
 
-                        # Save the image to a temporary file
-                        image.save(temp_file, format=image_format.upper())
-                        temp_file.flush()
-                        temp_files.append(temp_file.name)
-
-                        processed_file_name = preprocess_image_for_ocr(temp_file.name)
-
-                        # Update the image field with the file path
-                        content_dict.append({
-                            "type": "image",
-                            "image": f"file://{processed_file_name}"
-                        })
-                        print(content_dict, flush=True)
-                    except UnidentifiedImageError as e:
-                        return {"error": "Invalid image data: could not identify image."}
-                    except Exception as e:
-                        return {"error": str(e)}
-
-
-                else:
-                    # For TextContent, just append as is
-                    content_dict.append(content.dict())
-
-            # Add to the messages dictionary
-            messages_dict.append({
-                "role": message.role,
-                "content": content_dict
-            })
-
-        print(messages_dict, flush=True)
-        # Preparation for inference
-        text = processor.apply_chat_template(
-            messages_dict, tokenize=False, add_generation_prompt=True
-        )
-        print(f"text: {text}", flush=True)
-        image_inputs, video_inputs = process_vision_info(messages_dict)
         inputs = processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
+            text=[text_prompt],
+            images=final_image_inputs_for_processor if final_image_inputs_for_processor else None,
+            videos=final_video_inputs_for_processor if final_video_inputs_for_processor else None,
             padding=True,
             return_tensors="pt",
-        )
-        inputs = inputs.to("cuda")
+        ).to(model.device)
 
-        # Inference: Generation of the output
-        generated_ids = model.generate(**inputs, max_new_tokens=max_tokens, temperature=temperature, repetition_penalty=repetition_penalty)
-        generated_ids_trimmed = [
-            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-        ]
-        output_text = processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )
-        print(output_text[0], flush=True)
+        if 'pixel_values' in inputs and inputs['pixel_values'] is not None:
+            print(f"INFO: Image successfully processed into pixel_values tensor shape: {inputs['pixel_values'].shape}")
+        elif contains_qwen_image_parts and (not final_image_inputs_for_processor):
+            print(f"WARNING: Request contained image parts, but no images were passed to the model (pixel_values is None).")
 
-        return output_text[0]
+        gen_kwargs = {
+            "max_new_tokens": request.max_tokens,
+            "temperature": request.temperature if request.temperature is not None else 0.7,
+            "top_p": request.top_p if request.top_p is not None else 1.0,
+            "repetition_penalty": request.repetition_penalty if request.repetition_penalty is not None else 1.1,
+        }
 
+        if request.stream:
+            print(f"INFO: Request {request_id} - Streaming response.")
+            return StreamingResponse(
+                true_generate_response_stream(inputs, gen_kwargs, request_id, MODEL_NAME, processor),
+                media_type="text/event-stream"
+            )
+        else:
+            print(f"INFO: Request {request_id} - Non-streaming response.")
+            with torch.no_grad():
+                generated_ids = model.generate(**inputs, **gen_kwargs)
+
+            prompt_tokens_count = len(inputs["input_ids"][0]) if "input_ids" in inputs else 0
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            completion_tokens_count = len(generated_ids_trimmed[0]) if generated_ids_trimmed else 0
+            output_text = processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )[0]
+            usage = UsageInfo(
+                prompt_tokens=prompt_tokens_count,
+                completion_tokens=completion_tokens_count,
+                total_tokens=prompt_tokens_count + completion_tokens_count
+            )
+            response_message = ResponseMessage(role="assistant", content=output_text)
+            choice = ChatCompletionChoice(index=0, message=response_message, finish_reason="stop")
+            return OpenAIChatCompletionResponse(
+                id=request_id, model=MODEL_NAME, choices=[choice], usage=usage
+            )
+
+    except HTTPException as http_exc:
+        print(f"ERROR: Request {request_id} - HTTPException: Status {http_exc.status_code}, Detail: {http_exc.detail}")
+        raise
+    except Exception as e:
+        print(f"CRITICAL ERROR: Request {request_id} - Unexpected error: {type(e).__name__} - {e}")
+        import traceback
+        traceback.print_exc()
+        error_detail_str = str(e) if e is not None else "Unknown internal server error."
+        raise HTTPException(status_code=500, detail=f"Internal server error: {error_detail_str}")
     finally:
-        # Clean up the temporary files
-        for temp_file in temp_files:
-            os.remove(temp_file)
+        # print(f"DEBUG: Cleaning up temporary directory: {temp_dir}") # Can be noisy
+        for f_path in temp_files_to_clean:
+            try:
+                if os.path.exists(f_path): os.remove(f_path)
+            except Exception as e_clean: print(f"  Warning: Error cleaning temp file {f_path}: {e_clean}")
+        try:
+            if os.path.exists(temp_dir):
+                import shutil
+                shutil.rmtree(temp_dir)
+        except Exception as e_clean_dir: print(f"  Warning: Error cleaning temp dir {temp_dir}: {e_clean_dir}")
+        print(f"INFO: Request {request_id} - Processing finished.")
 
+# --- Main execution ---
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    current_file_name = os.path.splitext(os.path.basename(__file__))[0]
+    uvicorn.run(f"{current_file_name}:app", host="0.0.0.0", port=31000, reload=True, log_level="info")
