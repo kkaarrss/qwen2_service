@@ -3,8 +3,7 @@ import os
 import base64
 import io
 import torch
-# import cv2 # Not currently used
-# import numpy as np # Not currently used
+
 import time
 import uuid
 import requests # For downloading images from URLs
