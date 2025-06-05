@@ -1,0 +1,18 @@
+# Core ML/DL Libraries
+torch
+torchvision
+transformers
+accelerate # For device_map="auto" and efficient model loading/training
+bitsandbytes # Crucial for 4-bit quantization (bnb_4bit)
+
+# Web Framework & Server
+fastapi
+pydantic # For data validation and settings management (used by FastAPI)
+uvicorn[standard] # ASGI server, [standard] includes uvicorn, httptools, websockets, python-dotenv
+
+# Image Handling
+Pillow # For Image.open, Image.verify etc.
+
+# Utilities
+requests # For downloading images from HTTP URLs
+qwen-vl-utils 
