@@ -103,25 +103,17 @@ This uses the pre-built image from Docker Hub.
 
 If setting up locally, create a `requirements.txt` file with:
 ```txt
-# Core ML/DL Libraries
-torch
-torchvision
-torchaudio
-transformers
-accelerate
-bitsandbytes
-
-# Web Framework & Server
+bitsandbytes==0.45.3
 fastapi
 pydantic
-uvicorn[standard]
-
-# Image Handling
+transformers==4.51.3
+torch==2.6.0
 Pillow
+qwen-vl-utils==0.0.11
+uvicorn
+torchvision==0.21.0
+accelerate==0.26.1
 
-# Utilities
-requests
-qwen-vl-utils
 ```
 
 ## API Endpoints
