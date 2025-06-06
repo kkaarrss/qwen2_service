@@ -51,10 +51,11 @@ async def lifespan(app: FastAPI):
         )
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             MODEL_NAME,
-            quantization_config=quantization_config,
+#             quantization_config=quantization_config,
             device_map="auto",
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
+            load_in_4bit=True
+#             torch_dtype=torch.bfloat16,
+#             trust_remote_code=True,
         )
         processor = AutoProcessor.from_pretrained(
             MODEL_NAME,
