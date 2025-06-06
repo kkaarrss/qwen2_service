@@ -11,6 +11,7 @@ import asyncio # For streaming
 import json # For streaming JSON objects
 
 from PIL import Image, UnidentifiedImageError
+from contextlib import asynccontextmanager # Import for lifespan manager
 
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
 from transformers.generation.streamers import TextIteratorStreamer
@@ -32,11 +33,14 @@ MODEL_NAME = "unsloth/Qwen2.5-VL-7B-Instruct-unsloth-bnb-4bit"
 MIN_PIXELS = 256*28*28
 MAX_PIXELS = 1280*28*28
 
-# --- FastAPI App ---
-app = FastAPI(title="Qwen VL OpenAI-Compatible API (Cleaned)")
-
-@app.on_event("startup")
-async def startup_event():
+# --- Lifespan Manager for Model Loading ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Handles startup and shutdown events for the FastAPI application.
+    Loads the model and processor on startup and cleans up on shutdown.
+    This replaces the deprecated `on_event("startup")` decorator.
+    """
     global model, processor
 
     print(f"INFO: Loading Qwen VL model ({MODEL_NAME}) on startup...")
@@ -63,7 +67,21 @@ async def startup_event():
         print(f"CRITICAL ERROR: Failed to load Qwen VL model or processor during startup: {e}")
         import traceback
         traceback.print_exc()
-        # Consider exiting if model loading fails
+        # In a production environment, you might want the app to exit if model loading fails.
+
+    yield
+
+    # Cleanup on shutdown
+    print("INFO: Application shutting down. Releasing resources.")
+    model = None
+    processor = None
+    torch.cuda.empty_cache()
+
+
+# --- FastAPI App ---
+# Use the lifespan manager to handle startup and shutdown logic
+app = FastAPI(title="Qwen VL OpenAI-Compatible API (Cleaned)", lifespan=lifespan)
+
 
 # --- Simplified Image Handling ---
 def save_image_to_temp_file(image_bytes: bytes, image_format: str, output_dir: str) -> str:
@@ -78,7 +96,6 @@ def save_image_to_temp_file(image_bytes: bytes, image_format: str, output_dir: s
         fd, temp_image_path = tempfile.mkstemp(suffix=safe_suffix, dir=output_dir)
         with os.fdopen(fd, "wb") as tmp_file:
             tmp_file.write(image_bytes)
-        # print(f"DEBUG: Saved raw image for Qwen to temporary file: {temp_image_path}") # Optional debug
         return temp_image_path
     except Exception as e:
         print(f"ERROR: Failed to save image to temp file: {e}")
@@ -90,6 +107,8 @@ class ModelCard(BaseModel):
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "custom"
+    # New field to indicate model capabilities, including vision
+    capabilities: Optional[Dict[str, bool]] = None
 
 class ModelList(BaseModel):
     object: str = "list"
@@ -171,8 +190,12 @@ class OpenAIChatCompletionResponse(BaseModel):
 # --- API Endpoints ---
 @app.get("/v1/models", response_model=ModelList)
 async def list_models_endpoint():
+    """Lists the available models, indicating vision capabilities."""
     global MODEL_NAME
-    model_card = ModelCard(id=MODEL_NAME)
+    model_card = ModelCard(
+        id=MODEL_NAME,
+        capabilities={"vision": True}  # Explicitly state vision capability
+    )
     return ModelList(data=[model_card])
 
 async def true_generate_response_stream(
@@ -377,5 +400,6 @@ async def create_chat_completion(request: OpenAIChatCompletionRequest, raw_http_
 # --- Main execution ---
 if __name__ == "__main__":
     import uvicorn
+    # Correctly get the current file's name for uvicorn's reload feature
     current_file_name = os.path.splitext(os.path.basename(__file__))[0]
     uvicorn.run(f"{current_file_name}:app", host="0.0.0.0", port=31000, reload=True, log_level="info")
