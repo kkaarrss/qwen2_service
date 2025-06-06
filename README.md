@@ -7,29 +7,19 @@ This project provides an OpenAI-compatible API endpoint for interacting with a Q
 ## Features
 
 -   **OpenAI Compatibility:** Exposes `/v1/chat/completions` and `/v1/models` endpoints.
--   **Vision-Language Model:** Powered by Qwen2.5-VL.
--   **4-bit Quantization:** Uses `BitsAndBytesConfig` for efficient model loading.
--   **Streaming Support:** Provides real token-by-token streaming for responses.
--   **Image Handling:** Accepts images as URLs or base64 strings.
--   **Simplified Image Preprocessing:** Relies on PIL for basic validation and the Hugging Face `AutoProcessor` for model-specific image transformations.
--   **Dockerized:** Includes a Dockerfile and a pre-built image on Docker Hub (`pluskars/qwen-vl`).
+-   **Vision-Language Model:** Powered by Qwen2.5-VL, capable of understanding both text and images.
+-   **4-bit Quantization:** Uses `BitsAndBytesConfig` for efficient model loading and reduced memory footprint.
+-   **Streaming Support:** Provides real-time, token-by-token streaming for responses.
+-   **Flexible Image Handling:** Accepts images as `https://` URLs or `data:` URI (base64) strings.
+-   **Dockerized:** Includes a Dockerfile and a pre-built image on Docker Hub (`pluskars/qwen-vl`) for easy deployment.
 
 ## Prerequisites
 
 ### Common for All Methods:
 
 -   **NVIDIA GPU & Drivers:** Required for running the model efficiently. Ensure you have compatible NVIDIA drivers installed.
--   **CUDA Toolkit:** The version should be compatible with the PyTorch version used (e.g., CUDA 11.8 or 12.x). The Docker image `pluskars/qwen-vl` is built with a CUDA 12.8.1 base.
+-   **CUDA Toolkit:** The version should be compatible with the PyTorch version used. The Docker image `pluskars/qwen-vl` is built with a CUDA 12.8.1 base.
 -   **Python (for local setup):** Python 3.10 or newer is recommended.
-
-### For Running Without Docker (Local Setup from Source):
-
--   **Virtual Environment (Recommended):**
-    ```bash
-    python3 -m venv venv
-    source venv/bin/activate
-    ```
--   **Python Dependencies:** Install using the `requirements.txt` file.
 
 ### For Running With Docker:
 
@@ -50,7 +40,7 @@ This uses the pre-built image from Docker Hub.
     ```
 
 2.  **Run the Docker container:**
-    This command runs the container in detached mode (`-d`), maps port `31000` from the container to the host (the application inside listens on port `31000`), enables GPU access, and mounts your local Hugging Face cache to speed up model downloads on subsequent runs if models weren't baked into the image or if you switch models.
+    This command runs the container in detached mode (`-d`), maps port `31000` to the host, enables GPU access, and mounts your Hugging Face cache to speed up model downloads on subsequent runs.
 
     ```bash
     # Ensure NVIDIA Container Toolkit is installed and Docker daemon is restarted if needed.
@@ -61,13 +51,14 @@ This uses the pre-built image from Docker Hub.
         --gpus all \
         -p 31000:31000 \
         -v ~/.cache/huggingface:/root/.cache/huggingface \
+        --name qwen-vl-api \
         pluskars/qwen-vl:latest
     ```
 
 3.  **Check container logs (optional):**
-    Find the container ID using `docker ps`.
+    Wait a few minutes for the model to load, then check the logs to confirm it's running.
     ```bash
-    docker logs <container_id_or_name> -f
+    docker logs qwen-vl-api -f
     ```
     The server will be available at `http://localhost:31000`.
 
@@ -87,43 +78,40 @@ This uses the pre-built image from Docker Hub.
     ```
 
 3.  **Install dependencies:**
-    (Ensure you have a `requirements.txt` file as specified below)
+    (Create the `requirements.txt` file as specified below)
     ```bash
     pip install -r requirements.txt
     ```
 
-4.  **Run the FastAPI application using Uvicorn:**
-    The script `text_unsloth_2_5.py` contains the Uvicorn runner in its `if __name__ == "__main__":` block.
+4.  **Run the FastAPI application:**
     ```bash
     python text_unsloth_2_5.py
     ```
-    The server will start on `http://0.0.0.0:31000` (or the port configured in `text_unsloth_2_5.py`).
+    The server will start on `http://0.0.0.0:31000`.
 
 ### `requirements.txt` Content
 
-If setting up locally, create a `requirements.txt` file with:
+Create a `requirements.txt` file with these exact versions for reproducibility:
 ```txt
-bitsandbytes==0.45.3
 fastapi
-pydantic
-transformers==4.51.3
-torch==2.6.0
-Pillow
-qwen-vl-utils==0.0.11
 uvicorn
-torchvision==0.21.0
-accelerate==0.26.1
-
+pydantic
+transformers==4.41.2
+torch==2.3.0
+torchvision
+Pillow
+requests
+bitsandbytes
+accelerate
+qwen-vl-utils==0.0.11
 ```
 
 ## API Endpoints
 
-The server exposes the following OpenAI-compatible endpoints:
-
 ### 1. List Models
 
 -   **Endpoint:** `GET /v1/models`
--   **Description:** Returns a list of available models.
+-   **Description:** Returns a list of available models and their capabilities.
 -   **Example Response:**
     ```json
     {
@@ -132,8 +120,11 @@ The server exposes the following OpenAI-compatible endpoints:
         {
           "id": "unsloth/Qwen2.5-VL-7B-Instruct-unsloth-bnb-4bit",
           "object": "model",
-          "created": 1677610600,
-          "owned_by": "custom"
+          "created": 1721921387,
+          "owned_by": "custom",
+          "capabilities": {
+            "vision": true
+          }
         }
       ]
     }
@@ -158,38 +149,59 @@ The server exposes the following OpenAI-compatible endpoints:
             {
               "type": "image_url",
               "image_url": {
-                "url": "data:image/jpeg;base64,/9j/4AAQSk...==" // Or an https:// URL
+                "url": "data:image/jpeg;base64,/9j/4AAQSk...=="
               }
             }
           ]
         }
       ],
       "max_tokens": 150,
-      "stream": false, // Set to true for streaming
-      "temperature": 0.7
+      "stream": false
     }
     ```
--   **Non-Streaming Response & Streaming Response:** (Examples as in the previous README version)
 
-*(Keep the Non-Streaming and Streaming Response examples from the previous README here)*
+## Using with a Web UI (Open WebUI)
+
+You can connect this API to a user-friendly chat interface like [**Open WebUI**](https://github.com/open-webui/open-webui) to get a ChatGPT-like experience with image uploads, all running locally.
+
+### Step 1: Run the Qwen-VL API Server
+
+Follow the "Running with Docker" instructions above to start the API server.
+
+### Step 2: Run Open WebUI
+
+Run the Open WebUI container using Docker. The `--add-host` flag is crucial as it allows the Open WebUI container to communicate with the Qwen-VL API container.
+
+```bash
+docker run -d -p 3000:8080 \
+  --add-host=host.docker.internal:host-gateway \
+  -v open-webui:/app/backend/data \
+  --name open-webui --restart always \
+  ghcr.io/open-webui/open-webui:main
+```
+
+### Step 3: Configure Open WebUI
+
+1.  Open your browser and navigate to `http://localhost:3000`.
+2.  Create your admin account on the first launch.
+3.  Click the settings gear icon ⚙️ in the top right, then go to **Connections**.
+4.  Set the following values to connect to your local API server:
+    -   **Connection URL**: `http://host.docker.internal:31000/v1`
+    -   **API Key**: `1234` (The server doesn't require a key, but the UI needs a placeholder value).
+5.  Click **Save**. Open WebUI will connect to your server and automatically pull the model list.
+
+### Step 4: Start Chatting
+
+1.  Go back to the main chat screen.
+2.  At the top, click **"Select a Model"**.
+3.  You should see your model listed: `unsloth/Qwen2.5-VL-7B-Instruct-unsloth-bnb-4bit`. Select it.
+4.  You can now start a conversation! Use the paperclip icon 📎 to upload images.
 
 ## Example `curl` Requests
-
-*(Keep the curl examples from the previous README here, ensuring the port is 31000)*
 
 **List Models:**
 ```bash
 curl http://localhost:31000/v1/models
-```
-
-**Chat Completion (Non-Streaming, Text-Only):**
-```bash
-curl -X POST http://localhost:31000/v1/chat/completions \
--H "Content-Type: application/json" \
--d '{
-  "messages": [{"role": "user", "content": "Hello, how are you?"}],
-  "max_tokens": 50
-}'
 ```
 
 **Chat Completion (Non-Streaming, with Image URL):**
@@ -210,46 +222,22 @@ curl -X POST http://localhost:31000/v1/chat/completions \
 }'
 ```
 
-**Chat Completion (Streaming, with Base64 Image):**
+**Chat Completion (Streaming):**
 ```bash
-# Replace YOUR_BASE64_IMAGE_STRING with actual base64 data
-BASE64_IMAGE="YOUR_BASE64_IMAGE_STRING"
-
 curl -N -X POST http://localhost:31000/v1/chat/completions \
 -H "Content-Type: application/json" \
 -H "Accept: text/event-stream" \
--d @- <<EOF
-{
-  "messages": [
-    {
-      "role": "user",
-      "content": [
-        {"type": "text", "text": "What's in this picture?"},
-        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,${BASE64_IMAGE}"}}
-      ]
-    }
-  ],
+-d '{
+  "messages": [{"role": "user", "content": "Tell me a short story about a robot who discovers music."}],
   "stream": true,
-  "max_tokens": 100
-}
-EOF
+  "max_tokens": 150
+}'
 ```
-*Note: Added `-N` (no-buffering) to the streaming `curl` example for better SSE display.*
 
 ## Troubleshooting
 
--   **GPU Not Detected in Docker:** Ensure NVIDIA Container Toolkit is correctly installed and your Docker daemon is configured/restarted. Test with `docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu24.04 nvidia-smi`.
--   **Model Download Issues:** Ensure network connectivity. If using Docker, mounting `~/.cache/huggingface` can help persist downloads if the model isn't fully baked into the `pluskars/qwen-vl` image or for future model updates.
--   **Port Conflicts:** If port `31000` is already in use, the Docker command will fail to map it. Ensure the port is free or change the mapping (e.g., `-p 31001:31000`).
--   **`qwen-vl-utils` Version:** Ensure the pip-installed version is compatible with your `transformers` library version.
-
-## Building the Docker Image (Optional - if modifying the source)
-
-If you clone the repository and make changes to `text_unsloth_2_5.py` or `Dockerfile`, you can build your own image:
-```bash
-# In the root of the cloned repository (qwen2_service)
-docker build -t my-qwen-vl-api:latest .
-```
-Then run your custom image instead of `pluskars/qwen-vl:latest`.
-Make sure your `Dockerfile` copies `text_unsloth_2_5.py` and installs `qwen-vl-utils` from `requirements.txt`.
-```
+-   **GPU Not Detected in Docker:** Ensure the NVIDIA Container Toolkit is correctly installed and your Docker daemon has been restarted. Test with `docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi`.
+-   **Port Conflicts:** If port `31000` or `3000` is in use, the `docker run` command will fail. Free up the port or change the mapping (e.g., `-p 31001:31000`).
+-   **Open WebUI Can't Connect:**
+    -   Verify the API server is running with `docker logs qwen-vl-api`.
+    -   Ensure you used the correct URL: `http://host.docker.internal:31000/v1`. `localhost` will not work from inside the Open WebUI container.

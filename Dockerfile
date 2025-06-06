@@ -40,7 +40,7 @@ COPY text_unsloth_2_5.py .
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Expose the FastAPI port
-EXPOSE 8001
+EXPOSE 31000
 
 # Command to run your FastAPI application
-CMD ["uvicorn", "text_unsloth_2_5:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "text_unsloth_2_5:app", "--host", "0.0.0.0", "--port", "31000"]
