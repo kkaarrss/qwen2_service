@@ -253,14 +253,3 @@ docker build -t my-qwen-vl-api:latest .
 Then run your custom image instead of `pluskars/qwen-vl:latest`.
 Make sure your `Dockerfile` copies `text_unsloth_2_5.py` and installs `qwen-vl-utils` from `requirements.txt`.
 ```
-
-**Key Updates to this README:**
-
-*   **Repository Link:** Added your GitHub repo link.
-*   **Docker Hub Image:** Prioritized running from `pluskars/qwen-vl:latest`.
-*   **Local Setup:** Clarified that it's for running from the source code.
-*   **`requirements.txt`:** Updated to include `qwen-vl-utils`.
-*   **Filenames:** Consistently used `text_unsloth_2_5.py`.
-*   **Ports:** Standardized on port `31000` for examples, assuming this is what `text_unsloth_2_5.py` and your Docker image's `CMD`/`EXPOSE` are configured for.
-*   **Streaming Curl:** Added `-N` to the streaming curl example.
-*   **Building Docker Image Section:** Added an optional section for users who want to build the image from source after modifications.
