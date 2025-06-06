@@ -31,7 +31,7 @@ processor = None
 # --- Configuration ---
 MODEL_NAME = "unsloth/Qwen2.5-VL-7B-Instruct-unsloth-bnb-4bit"
 MIN_PIXELS = 256*28*28
-MAX_PIXELS = 1280*28*28
+MAX_IMAGE_PIXELS = 400000000
 
 # --- Lifespan Manager for Model Loading ---
 @asynccontextmanager
